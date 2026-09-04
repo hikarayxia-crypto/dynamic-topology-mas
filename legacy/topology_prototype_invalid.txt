@@ -1,0 +1,155 @@
+import numpy as np
+import torch
+import torch.nn as nn
+from dataclasses import dataclass, field
+from typing import List, Dict, Set, Any, Optional
+
+# ================= 1. 基础数据结构 (源自 AGENT_ARCHITECTURE.md 与 源码1) =================
+
+@dataclass
+class AgentState:
+    [span_3](start_span)[span_4](start_span)"""智能体动态状态[span_3](end_span)[span_4](end_span)"""
+    agent_id: int
+    pos: np.ndarray = np.array([0.0, 0.0])
+    vel: np.ndarray = np.array([0.0, 0.0])
+    yaw: float = 0.0
+    energy: float = 1.0
+    
+    # [span_5](start_span)拓扑相关特征[span_5](end_span)
+    node_degree: int = 0
+    connectivity: float = 1.0
+    neighbor_ids: List[int] = field(default_factory=list)
+    neighbor_states: List["AgentState"] = field(default_factory=list)
+
+    def to_vector(self) -> np.ndarray:
+        [span_6](start_span)"""将核心状态转为向量用于神经网络输入[span_6](end_span)"""
+        return np.concatenate([
+            self.pos, self.vel, 
+            [self.yaw, self.energy, self.node_degree, self.connectivity]
+        ])
+
+# ================= 2. 动态拓扑管理器 (整合绑定逻辑与边管理) =================
+
+class DynamicTopologyManager:
+    def __init__(self):
+        self.topology_nodes: Set[str] = set()       # 拓扑节点
+        self.binding_map: Dict[int, str] = dict()    # 智能体ID -> 节点ID
+        self.agent_status: Dict[int, str] = dict()   # 状态：online/offline
+        self.adj: Dict[str, Set[str]] = dict()       # 邻接表：节点ID -> Set(邻居节点ID)
+
+    def add_node(self, node_id: str):
+        if node_id not in self.topology_nodes:
+            self.topology_nodes.add(node_id)
+            self.adj[node_id] = set()
+            return True
+        return False
+
+    def bind_agent(self, agent_id: int, node_id: str):
+        """实现智能体与节点的绑定"""
+        if node_id in self.topology_nodes:
+            self.binding_map[agent_id] = node_id
+            self.agent_status[agent_id] = "online"
+            return True
+        return False
+
+    def set_connection(self, node_a: str, node_b: str, connected: bool = True):
+        """动态建立或断开节点间的连接（边）"""
+        if node_a in self.topology_nodes and node_b in self.topology_nodes:
+            if connected:
+                self.adj[node_a].add(node_b)
+                self.adj[node_b].add(node_a)
+            else:
+                self.adj[node_a].discard(node_b)
+                self.adj[node_b].discard(node_a)
+
+    def update_agent_topology_features(self, agents_dict: Dict[int, AgentState]):
+        [span_7](start_span)"""核心：根据当前物理拓扑，刷新所有智能体的感知状态[span_7](end_span)"""
+        for agent_id, state in agents_dict.items():
+            if agent_id not in self.binding_map: continue
+            
+            curr_node = self.binding_map[agent_id]
+            neighbor_nodes = self.adj.get(curr_node, set())
+            
+            # 找到绑定在邻居节点上的所有在线智能体
+            neighbor_ids = [
+                a_id for a_id, n_id in self.binding_map.items() 
+                if n_id in neighbor_nodes and self.agent_status.get(a_id) == "online"
+            ]
+            
+            # 更新状态属性
+            state.neighbor_ids = neighbor_ids
+            state.neighbor_states = [agents_dict[nid] for nid in neighbor_ids if nid in agents_dict]
+            state.node_degree = len(neighbor_ids)
+            # 计算连通率：实际邻居数 / (总节点数-1)
+            total_n = len(self.topology_nodes)
+            state.connectivity = state.node_degree / (total_n - 1) if total_n > 1 else 1.0
+
+# ================= 3. 特征编码模块 (源自 源码5-8) =================
+
+class StateFeatureEncoder(nn.Module):
+    def __init__(self, input_dim: int = 8, embed_dim: int = 64):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, embed_dim),
+            [span_8](start_span)nn.LayerNorm(embed_dim)[span_8](end_span)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.encoder(x)
+
+class NeighborFeatureEncoder(nn.Module):
+    def __init__(self, state_dim: int = 8, embed_dim: int = 64):
+        super().__init__()
+        self.self_encoder = StateFeatureEncoder(state_dim, embed_dim)
+        self.neighbor_encoder = StateFeatureEncoder(state_dim, embed_dim)
+
+    def encode(self, state: AgentState) -> torch.Tensor:
+        # [span_9](start_span)自身编码[span_9](end_span)
+        self_vec = torch.FloatTensor(state.to_vector()).unsqueeze(0)
+        self_feat = self.self_encoder(self_vec)
+        
+        # [span_10](start_span)邻居融合编码（Mean Pooling）[span_10](end_span)
+        if not state.neighbor_states:
+            neighbor_feat = torch.zeros(1, self.self_encoder.encoder[-2].out_features)
+        else:
+            n_vecs = torch.stack([torch.FloatTensor(s.to_vector()) for s in state.neighbor_states])
+            neighbor_feat = self.neighbor_encoder(n_vecs).mean(dim=0, keepdim=True)
+            
+        [span_11](start_span)return torch.cat([self_feat, neighbor_feat], dim=-1)[span_11](end_span)
+
+# ================= 4. 运行示例 (演示动态变化) =================
+
+if __name__ == "__main__":
+    # 1. 初始化
+    topo = DynamicTopologyManager()
+    encoder = NeighborFeatureEncoder(state_dim=8, embed_dim=16)
+    
+    # 2. 创建节点与智能体
+    for n in ["N1", "N2", "N3"]: topo.add_node(n)
+    agents = {
+        1: AgentState(agent_id=1, pos=np.array([0, 0])),
+        2: AgentState(agent_id=2, pos=np.array([1, 1])),
+        3: AgentState(agent_id=3, pos=np.array([2, 2]))
+    }
+    topo.bind_agent(1, "N1"); topo.bind_agent(2, "N2"); topo.bind_agent(3, "N3")
+
+    print("--- 场景 A: 全连通结构 ---")
+    topo.set_connection("N1", "N2", True)
+    topo.set_connection("N1", "N3", True)
+    topo.update_agent_topology_features(agents)
+    
+    feat_a = encoder.encode(agents[1])
+    print(f"智能体1 邻居数: {agents[1].node_degree}, 特征维度: {feat_a.shape}")
+
+    print("\n--- 场景 B: 动态断开 N1 与 N3 的连接 ---")
+    topo.set_connection("N1", "N3", False)
+    topo.update_agent_topology_features(agents)
+    
+    feat_b = encoder.encode(agents[1])
+    print(f"智能体1 邻居数: {agents[1].node_degree} (邻居仅剩智能体2)")
+    
+    # 验证特征值是否发生变化
+    diff = torch.norm(feat_a - feat_b).item()
+    print(f"拓扑变化导致的特征向量偏移量: {diff:.4f}")
